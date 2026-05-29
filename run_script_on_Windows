@@ -1,0 +1,95 @@
+@echo off
+setlocal EnableExtensions
+
+REM
+==========================================================
+REM Launcher (Windows) - NO installs, NO updates
+REM Requirements:
+REM - Python 3.x installed and available as &quot;py&quot; or &quot;python&quot;
+REM - Biopython installed in that Python environment
+REM
+==========================================================
+
+cd /d &quot;%~dp0&quot;
+
+set &quot;SCRIPT=exclusivity_assay.py&quot;
+
+echo
+==========================================================
+echo BLAST Pipeline Launcher
+echo Folder: %CD%
+echo Script: %SCRIPT%
+echo
+==========================================================
+echo.
+
+REM --- Check script exists ---
+if not exist &quot;%SCRIPT%&quot; (
+echo [ERROR] Script not found: &quot;%SCRIPT%&quot;
+echo Put run_pipeline.bat in the same folder as %SCRIPT%.
+echo.
+
+pause
+exit /b 1
+)
+
+REM --- Check Python command (prefer py -3) ---
+set &quot;PY_CMD=&quot;
+
+where py &gt;nul 2&gt;nul
+if %errorlevel%==0 (
+set &quot;PY_CMD=py -3&quot;
+) else (
+where python &gt;nul 2&gt;nul
+if %errorlevel%==0 (
+set &quot;PY_CMD=python&quot;
+) else (
+echo [ERROR] Python not found.
+echo Install Python 3.x and ensure &quot;py&quot; or &quot;python&quot; is in PATH.
+echo.
+pause
+exit /b 1
+)
+)
+
+echo [INFO] Using: %PY_CMD%
+%PY_CMD% --version
+echo.
+
+REM --- Check Biopython is installed ---
+%PY_CMD% -c &quot;import Bio&quot; &gt;nul 2&gt;nul
+
+if not %errorlevel%==0 (
+echo [ERROR] Biopython is not installed for this Python.
+echo Install it with:
+echo %PY_CMD% -m pip install biopython
+echo.
+pause
+exit /b 1
+)
+
+echo [INFO] Dependencies OK (Biopython found).
+echo.
+
+REM --- Run script ---
+echo
+==========================================================
+echo [RUN] %SCRIPT%
+echo
+==========================================================
+echo.
+
+%PY_CMD% &quot;%SCRIPT%&quot;
+set &quot;EXITCODE=%errorlevel%&quot;
+
+echo.
+echo
+==========================================================
+echo Execution finished with exit code: %EXITCODE%
+echo Press any key to close this window...
+echo
+==========================================================
+
+pause &gt;nul
+
+exit /b %EXITCODE%
