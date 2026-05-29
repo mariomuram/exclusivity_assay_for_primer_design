@@ -1,0 +1,1334 @@
+# ==================== IMPORTS ====================
+
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from Bio.Blast import NCBIXML
+from itertools import product
+import warnings
+import contextlib
+import os
+import io
+from collections import Counter
+import time
+from Bio import Entrez
+Entrez.email = "mariomuram01@gmail.com"
+import xml.parsers.expat
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request
+import re
+import threading
+import traceback
+
+# ==================== CONFIGURATION PARAMETERS ====================
+
+blast_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+poll_interval_sec = 60
+max_retries_blast = 5
+max_retries_parse = 5
+MAX_POLLS_BEFORE_RESTART = 15
+
+# HTTP timeout: maximum time NCBI has to respond per request
+DEFAULT_HEADERS = {"User-Agent": f"BLAST/1.0 (mailto:{Entrez.email})"}
+HTTP_TIMEOUT = 60
+
+# Live status table configuration
+TABLE_UI = True
+TABLE_REFRESH_SEC = 10.0
+ANSI = True
+
+# Base output directory (defined in main() from the output name)
+BASE_OUTPUT_DIR = None
+
+# Subfolder for BLAST TSV tables (populated in main())
+BLAST_TABLES_DIR = None
+
+# Global print lock to avoid overlapping prints from different threads
+PRINT_LOCK = threading.Lock()
+
+
+# ==================== STATUS BOARD (LIVE TABLE) ====================
+
+status_store = {}
+status_lock = threading.Lock()
+status_stop_event = threading.Event()
+status_pause_event = threading.Event()
+interactive_lock = threading.Lock()
+
+
+# Normalize BLAST status into UI-friendly state names.
+def _normalize_state(status_str, there_are_hits=None):
+    if status_str == "READY":
+        return "READY"
+    if status_str == "FAILED":
+        return "FAILED"
+    if status_str == "WAITING":
+        return "ONGOING" if there_are_hits else "WAITING"
+    return status_str or "UNKNOWN"
+
+
+# Create or update the status row for a given primer/probe in the live status store.
+def status_set(primer, **updates):
+    with status_lock:
+        row = status_store.get(
+            primer,
+            {
+                "primer": primer,
+                "rid": "-",
+                "status": "QUEUED",
+                "polls": 0,
+                "aligns": "-",
+                "hits": "-",
+                "exclusions": "",
+                "exclusions_list": [],
+                "end_status": "-",
+                "restarts": 0,
+                "blast_tries": 0,
+                "parse_tries": 0,
+            },
+        )
+        for k, v in updates.items():
+            if v is not None:
+                row[k] = v
+        status_store[primer] = row
+
+
+# Append a new exclusion entry (organism name + taxid) to the status row for a primer.
+def status_append_exclusion(primer, org_name, txid):
+    with status_lock:
+        row = status_store.get(primer)
+        if row is None:
+            row = {
+                "primer": primer,
+                "rid": "-",
+                "status": "QUEUED",
+                "polls": 0,
+                "aligns": "-",
+                "hits": "-",
+                "exclusions": "",
+                "exclusions_list": [],
+                "end_status": "-",
+                "restarts": 0,
+                "blast_tries": 0,
+                "parse_tries": 0,
+            }
+
+        lst = row.get("exclusions_list", [])
+        lst.append(f"{org_name} (txid={txid})")
+        row["exclusions_list"] = lst
+        row["exclusions"] = "\n".join(lst)
+        status_store[primer] = row
+
+
+# Render the live status table once (single refresh) to the terminal.
+def status_render_once():
+    with status_lock:
+        rows = sorted(status_store.values(), key=lambda r: str(r.get("primer", "")))
+
+        headers = [
+            "Primer",
+            "RID",
+            "Status",
+            "Polls",
+            "Restarts",
+            "B.Att",
+            "P.Att",
+            "Aligns",
+            "Hits",
+            "Exclusions",
+            "End Status",
+        ]
+
+        def row_to_cells(r):
+            return [
+                str(r.get("primer", "")),
+                str(r.get("rid", "")),
+                str(r.get("status", "")),
+                str(r.get("polls", "")),
+                str(r.get("restarts", 0)),
+                str(r.get("blast_tries", 0)),
+                str(r.get("parse_tries", 0)),
+                str(r.get("aligns", "")),
+                str(r.get("hits", "")),
+                str(r.get("exclusions", "")),
+                str(r.get("end_status", "")),
+            ]
+
+        data_rows = [row_to_cells(r) for r in rows]
+
+        def cell_lines(val):
+            s = str(val)
+            return s.splitlines() if "\n" in s else [s]
+
+        num_cols = len(headers)
+        widths = []
+        for col_idx in range(num_cols):
+            maxw = len(headers[col_idx])
+            for row in data_rows:
+                for line in cell_lines(row[col_idx]):
+                    if len(line) > maxw:
+                        maxw = len(line)
+            widths.append(maxw)
+
+        def fmt_row(vals):
+            return " | ".join(str(v).ljust(w) for v, w in zip(vals, widths))
+
+        row_sep = "-+-".join("-" * w for w in widths)
+
+        with PRINT_LOCK:
+            if ANSI:
+                print("\x1b[2J", "\x1b[H", sep="", end="")
+            else:
+                os.system("cls" if os.name == "nt" else "clear")
+
+            print(f"BLAST Jobs Status (updated every ~{TABLE_REFRESH_SEC}s)\n")
+            print(fmt_row(headers))
+            print(row_sep)
+
+            for r in data_rows:
+                split_cells = [cell_lines(c) for c in r]
+                height = max(len(lines) for lines in split_cells) if split_cells else 1
+                for i in range(height):
+                    line_vals = [
+                        lines[i] if i < len(lines) else "" for lines in split_cells
+                    ]
+                    print(fmt_row(line_vals))
+                print(row_sep)
+            print()
+
+
+# Background loop that periodically refreshes the live status table until stopped.
+def status_renderer_loop():
+    while not status_stop_event.is_set():
+        if status_pause_event.is_set():
+            status_stop_event.wait(TABLE_REFRESH_SEC)
+            continue
+        status_render_once()
+        status_stop_event.wait(TABLE_REFRESH_SEC)
+
+
+# ==================== INPUT: PRIMERS / PROBES ====================
+
+# Read primers/probes from user input and expand IUPAC ambiguity codes into concrete sequences.
+def read_primers_and_probes():
+    ambiguities = {
+        "Y": ["C", "T"],
+        "R": ["A", "G"],
+        "W": ["A", "T"],
+        "S": ["G", "C"],
+        "K": ["T", "G"],
+        "M": ["C", "A"],
+        "D": ["A", "G", "T"],
+        "V": ["A", "C", "G"],
+        "H": ["A", "C", "T"],
+        "B": ["C", "G", "T"],
+        "N": ["A", "C", "G", "T"],
+        "I": ["A", "C", "G", "T"],
+    }
+
+    records_all = []
+    print("Enter primers and probes. Type 'done' to finish.")
+    while True:
+        name = input("Primer/probe name: ").lower()
+        if name.lower() == "done":
+            break
+        seq = input("Sequence: ").upper()
+
+        record = SeqRecord(Seq(seq), id=name)
+
+        ambiguities_per_base = []
+        for base in str(record.seq):
+            if base in ambiguities:
+                ambiguities_per_base.append(ambiguities[base])
+            else:
+                ambiguities_per_base.append([base])
+
+        for i, final_bases in enumerate(product(*ambiguities_per_base), start=1):
+            final_seq = "".join(final_bases)
+            record_new = SeqRecord(Seq(final_seq), id=f"{record.id}.{i}")
+            records_all.append(record_new)
+
+    return records_all
+
+
+# ==================== TAXONOMY HELPER (Entrez) ====================
+
+# Resolve an NCBI Taxonomy ID (taxid) from a species name using Entrez, with maximum 5 retries in case NCBI connection fails.
+def get_taxid_from_species_name(species_name):
+    for attempt in range(5):
+        try:
+            handle = Entrez.esearch(db="taxonomy", term=species_name, retmode="xml")
+            record = Entrez.read(handle)
+            handle.close()
+            if record["IdList"]:
+                return record["IdList"][0]
+            else:
+                return None
+        except Exception as e:
+            print(f"Entrez error: {e}")
+            time.sleep(10)
+    return None
+
+
+# ==================== QBLAST + POLLING ====================
+
+# Submit a remote BLAST (QBlast) request and return the RID and recommended wait time (RTOE).
+def _qblast_put(
+    program,
+    database,
+    sequence,
+    hitlist_size=5000,
+    word_size=7,
+    short_query=True,
+    entrez_query=None,
+):
+    params = {
+        "CMD": "Put",
+        "PROGRAM": program,
+        "DATABASE": database,
+        "QUERY": str(sequence),
+        "HITLIST_SIZE": str(hitlist_size),
+        "WORD_SIZE": str(word_size),
+    }
+
+    if short_query:
+        params["SHORT_QUERY_ADJUST"] = "yes"
+    if entrez_query:
+        params["ENTREZ_QUERY"] = entrez_query
+
+    if Entrez.email:
+        params["EMAIL"] = Entrez.email.strip()
+    params["TOOL"] = "primer-pipeline"
+
+    data = urlencode(params).encode("utf-8")
+    req = Request(blast_url, data=data, headers=DEFAULT_HEADERS)
+    with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        text = resp.read().decode("utf-8")
+
+    rid_match = re.search(r"RID\s*=\s*([A-Z0-9\-]+)", text)
+    rtoe_match = re.search(r"RTOE\s*=\s*(\d+)", text)
+
+    if not rid_match or not rtoe_match:
+        raise RuntimeError("No RID/RTOE received from QBlast Put")
+
+    rid = rid_match.group(1)
+    rtoe = int(rtoe_match.group(1))
+    return rid, rtoe
+
+
+# Check remote BLAST job status ("Get" SearchInfo) and return (Status, ThereAreHits).
+def _qblast_check_status(rid):
+    params = {"CMD": "Get", "RID": rid, "FORMAT_OBJECT": "SearchInfo"}
+    url = f"{blast_url}?{urlencode(params)}"
+    req = Request(url, headers=DEFAULT_HEADERS)
+    with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        text = resp.read().decode("utf-8")
+
+    status_match = re.search(r"Status=(\w+)", text)
+    tah_match = re.search(r"ThereAreHits=(\w+)", text)
+    status = status_match.group(1) if status_match else "UNKNOWN"
+    tah = tah_match.group(1).lower() == "yes" if tah_match else None
+    return status, tah
+
+
+# Fetch remote BLAST results for a given RID in the requested format (default XML).
+def _qblast_fetch_results(rid, format_type="XML"):
+    params = {"CMD": "Get", "RID": rid, "FORMAT_TYPE": format_type}
+    url = f"{blast_url}?{urlencode(params)}"
+    req = Request(url, headers=DEFAULT_HEADERS)
+    with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return resp.read().decode("utf-8")
+
+
+# Run a remote BLAST and poll until READY. Restart if polling exceeds a threshold.
+def _run_qblast_with_polling(
+    sequence,
+    database,
+    entrez_query,
+    primer_label,
+    word_size=7,
+    hitlist_size=5000,
+    short_query=True,
+    poll_interval=None,
+    max_polls_before_restart=None,
+):
+
+    poll_interval = poll_interval or poll_interval_sec
+    if max_polls_before_restart is None:
+        max_polls_before_restart = MAX_POLLS_BEFORE_RESTART
+
+    rid, rtoe = _qblast_put(
+        program="blastn",
+        database=database,
+        sequence=sequence,
+        hitlist_size=hitlist_size,
+        word_size=word_size,
+        short_query=short_query,
+        entrez_query=entrez_query,
+    )
+    status_set(primer_label, rid=rid, status="SUBMITTED", polls=0)
+
+    time.sleep(max(rtoe, poll_interval))
+
+    polls_this_rid = 0
+    restart_count = 0
+
+    while True:
+        status, tah = _qblast_check_status(rid)
+        polls_this_rid += 1
+
+        mapped = _normalize_state(status, there_are_hits=tah)
+        status_set(primer_label, status=mapped, polls=polls_this_rid)
+
+        if status == "READY":
+            xml_text = _qblast_fetch_results(rid, format_type="XML")
+            status_set(primer_label, status="READY")
+            return io.StringIO(xml_text), rid
+
+        if status == "FAILED":
+            status_set(primer_label, status="FAILED")
+            raise RuntimeError("BLAST_FAILED")
+
+        need_restart = polls_this_rid >= max_polls_before_restart
+
+        if need_restart:
+            restart_count += 1
+            if restart_count > max_retries_blast:
+                status_set(
+                    primer_label,
+                    status="FAILED",
+                    end_status=f"Failed (max restarts {max_retries_blast})",
+                )
+                raise RuntimeError("BLAST_FAILED_MAX_POLLS")
+
+            with PRINT_LOCK:
+                print(
+                    f"[{primer_label}] Restarting BLAST (restart #{restart_count}) "
+                    f"- polls_this_rid={polls_this_rid}"
+                )
+
+            status_set(primer_label, status="RESTARTING")
+            time.sleep(2)
+
+            rid, rtoe = _qblast_put(
+                program="blastn",
+                database=database,
+                sequence=sequence,
+                hitlist_size=hitlist_size,
+                word_size=word_size,
+                short_query=short_query,
+                entrez_query=entrez_query,
+            )
+
+            polls_this_rid = 0
+            status_set(
+                primer_label,
+                rid=rid,
+                status="SUBMITTED",
+                polls=0,
+                restarts=restart_count,
+            )
+            time.sleep(max(rtoe, poll_interval))
+            continue
+
+        time.sleep(poll_interval)
+
+
+# ==================== ENTREZ QUERY BUILDER ====================
+
+# Build an ENTREZ_QUERY string of the form: NOT (term1 OR term2 OR ...), including taxid exclusions.
+def build_entrez_not_query(name_exclusions, taxid_exclusions):
+    """
+    Build an ENTREZ_QUERY string of the form:
+        NOT (term1 OR term2 OR ...)
+
+    - name_exclusions: terms exactly as provided by the user
+    - taxid_exclusions: set of taxids (int/str) added iteratively
+    """
+    terms = []
+
+    if name_exclusions:
+        for org in name_exclusions:
+            org = org.strip()
+            if not org:
+                continue
+            terms.append(org)
+
+    if taxid_exclusions:
+        for taxid in sorted(taxid_exclusions):
+            terms.append(f"txid{taxid}[Organism:exp]")
+
+    terms.extend(
+        [
+            "predicted[Title]",
+            "uncultured[All Fields]",
+        ]
+    )
+
+    if not terms:
+        return None
+
+    return "NOT (" + " OR ".join(terms) + ")"
+
+
+# ==================== SAVE HITS TABLE (TSV) ====================
+
+# Save a per-iteration BLAST hit table to TSV, including primer metadata and the ENTREZ_QUERY used.
+def save_hits_table(primer_id, primer_seq, entrez_query, hits, iteration_index):
+    """
+    Save a TSV for a specific BLAST run (one iteration) containing:
+    - primer_id
+    - primer_sequence
+    - the ENTREZ_QUERY used for that BLAST
+    - all hits (already filtered by identity >= 70%)
+    """
+    if not hits:
+        return
+
+    os.makedirs(BLAST_TABLES_DIR, exist_ok=True)
+    filename = os.path.join(
+        BLAST_TABLES_DIR, f"{primer_id}_iter{iteration_index}_hits.tsv"
+    )
+
+    with open(filename, "w") as out:
+        header = [
+            "primer_id",
+            "primer_sequence",
+            "entrez_query",
+            "accession",
+            "organism",
+            "percent_identity",
+            "start",
+            "end",
+            "strand",
+            "mismatches",
+            "mismatch_positions",
+            "gap_intervals",
+        ]
+        out.write("\t".join(header) + "\n")
+
+        eq = entrez_query if entrez_query else "-"
+        seq = primer_seq if primer_seq else "-"
+
+        for h in hits:
+            mp = h.get("mismatch_positions") or []
+            if mp and isinstance(mp[0], int):
+                mp_str = ";".join(str(x) for x in mp)
+            else:
+                mp_str = "-"
+
+            gi = h.get("gap_intervals") or []
+            if gi and isinstance(gi[0], (tuple, list)):
+                gi_str = ";".join(f"{a}-{b}" for a, b in gi)
+            else:
+                gi_str = "-"
+
+            row = [
+                primer_id,
+                seq,
+                eq,
+                str(h.get("accession", "")),
+                str(h.get("organism", "")),
+                f'{h.get("percent_identity", 0.0):.2f}',
+                str(h.get("start", "")),
+                str(h.get("end", "")),
+                str(h.get("strand", "")),
+                str(h.get("mismatches", "")),
+                mp_str,
+                gi_str,
+            ]
+            out.write("\t".join(row) + "\n")
+
+
+# ==================== RUN BLAST FOR ONE RECORD ====================
+
+# Run iterative BLAST for a single oligo, expanding exclusions interactively and accumulating unique hits.
+def run_blast(record, exclusions_list, database_option):
+    """
+    For each oligo:
+    - Launch BLAST with an ENTREZ_QUERY (which is modified with exclusions).
+    - For EACH BLAST (iteration), generate an independent TSV under blast_tables/.
+    - Return a list of accumulated unique hits (used downstream for the amplicon pipeline).
+    """
+    exclusion_set = set()   # taxids excluded interactively
+    all_hits = []           # accumulated unique hits (for the rest of the pipeline)
+    seen_keys = set()       # keys used for global deduplication
+    align_retries = 0
+    iteration_index = 0
+
+    while True:
+        if len(exclusion_set) == 6:
+            status_set(record.id, status="COMPLETED", end_status="Done")
+            break
+
+        iteration_index += 1
+
+        full_query = build_entrez_not_query(
+            name_exclusions=exclusions_list,
+            taxid_exclusions=exclusion_set
+        )
+
+        time.sleep(10)
+
+        last_exc = None
+        status_set(record.id, blast_tries=0)
+
+        # ---------- BLAST retry loop ----------
+        for attempt in range(max_retries_blast):
+            try:
+                status_set(
+                    record.id,
+                    status="SUBMITTED",
+                    end_status="-",
+                    parse_tries=0,
+                )
+
+                handle, rid = _run_qblast_with_polling(
+                    sequence=record.seq,
+                    database=database_option,
+                    entrez_query=full_query,
+                    primer_label=record.id,
+                    word_size=7,
+                    hitlist_size=5000,
+                    short_query=True,
+                    poll_interval=poll_interval_sec,
+                    max_polls_before_restart=MAX_POLLS_BEFORE_RESTART,
+                )
+                break
+
+            except Exception as e:
+                last_exc = e
+                current_blast_tries = (
+                    status_store.get(record.id, {}).get("blast_tries", 0) + 1
+                )
+                status_set(
+                    record.id,
+                    blast_tries=current_blast_tries,
+                    status="RETRYING",
+                    end_status=f"Retry BLAST {current_blast_tries}/{max_retries_blast}",
+                )
+                time.sleep(10)
+        else:
+            current_blast_tries = status_store.get(record.id, {}).get(
+                "blast_tries", 0
+            )
+            status_set(
+                record.id,
+                status="FAILED",
+                end_status=(
+                    f"Failed (BLAST attempts "
+                    f"{current_blast_tries}/{max_retries_blast})"
+                ),
+            )
+            raise RuntimeError(
+                f"BLAST failed after {max_retries_blast} retries: {last_exc}"
+            )
+
+        # ---------- Parse XML ----------
+        try:
+            hits, number_alignments = parse_blast_xml(handle, record)
+        except RuntimeError as e:
+            if str(e) == "BLAST_XML_ERROR":
+                current_parse_tries = (
+                    status_store.get(record.id, {}).get("parse_tries", 0) + 1
+                )
+                status_set(
+                    record.id,
+                    parse_tries=current_parse_tries,
+                    status="RETRYING",
+                    end_status=(
+                        f"Retry PARSE {current_parse_tries}/{max_retries_parse}"
+                    ),
+                )
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+                if current_parse_tries == max_retries_parse:
+                    status_set(
+                        record.id,
+                        status="FAILED",
+                        end_status=(
+                            "Failed (Parse attempts "
+                            f"{current_parse_tries}/{max_retries_parse})"
+                        ),
+                    )
+                    raise RuntimeError("BLAST_PARSE_MAX_RETRIES")
+
+                continue
+            else:
+                status_set(
+                    record.id,
+                    status="FAILED",
+                    end_status="Failed (Parse unexpected)",
+                )
+                raise
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+        # ---------- Save TSV PER BLAST (do not group iterations) ----------
+        try:
+            save_hits_table(
+                primer_id=record.id,
+                primer_seq=str(record.seq),
+                entrez_query=full_query,
+                hits=hits,
+                iteration_index=iteration_index,
+            )
+        except Exception as e:
+            with PRINT_LOCK:
+                print(
+                    f"[WARN] Could not save the hits table for {record.id}, "
+                    f"iteration {iteration_index}: {e}"
+                )
+
+        # ---------- Specific retry for ZERO alignments ----------
+        if number_alignments == 0 and align_retries < 5:
+            align_retries += 1
+            status_set(
+                record.id,
+                status="RETRYING",
+                aligns=0,
+                hits=0,
+                end_status=f"Retry ZERO_ALIGN {align_retries}/5 (no alignments)",
+            )
+            time.sleep(10)
+            continue
+
+        # ---------- Deduplicate hits globally (for the pipeline) ----------
+        unique_hits = []
+        for h in hits:
+            key = (
+                h.get("primer/probe"),
+                h.get("accession"),
+                h.get("organism"),
+                h.get("percent_identity"),
+                h.get("start"),
+                h.get("end"),
+                h.get("strand"),
+                h.get("mismatches"),
+                tuple(h.get("mismatch_positions") or []),
+                tuple(h.get("gap_intervals") or []),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_hits.append(h)
+
+        status_set(record.id, parse_tries=0)
+
+        total_unique_hits = len(seen_keys)
+        status_set(
+            record.id,
+            status="ONGOING",
+            end_status="-",
+            aligns=number_alignments,
+            hits=total_unique_hits,
+        )
+
+        all_hits.extend(unique_hits)
+
+        # If BLAST is no longer saturated, finish for this oligo
+        if number_alignments < 4950:
+            status_set(record.id, status="COMPLETED", end_status="Done")
+            break
+
+        # ---------- Interactive block to exclude additional species ----------
+        species_per_accession = {
+            (hit["accession"], hit["organism"]) for hit in unique_hits
+        }
+        count_organisms_hits = Counter(
+            " ".join(org.split()[:2]) for _, org in species_per_accession
+        )
+
+        if not count_organisms_hits:
+            status_set(record.id, status="COMPLETED", end_status="Done")
+            break
+
+        added_new_taxid = False
+
+        with interactive_lock:
+            status_pause_event.set()
+            try:
+                while True:
+                    with PRINT_LOCK:
+                        print(
+                            f"\n[INTERACTIVE] Primer {record.id}: "
+                            f"number of alignments = {number_alignments}"
+                        )
+                        print(
+                            "Top 5 species by number of accessions in this iteration:"
+                        )
+                        top5 = count_organisms_hits.most_common(5)
+                        for i, (species, cnt) in enumerate(top5, start=1):
+                            print(f"  {i}. {species}  (accessions: {cnt})")
+                        print(
+                            "\nType the species name to exclude "
+                            "(for example: 'Vibrio cholerae')"
+                        )
+                        print(
+                            "or type 'skip' to exclude none and finish this oligo.\n"
+                        )
+
+                    user_input = input("Species to exclude: ").strip()
+                    if not user_input:
+                        continue
+
+                    if user_input.lower() == "skip":
+                        added_new_taxid = False
+                        break
+
+                    species_choice = " ".join(user_input.split()[:2])
+                    available_species = {name for name, _ in top5}
+                    if species_choice not in available_species:
+                        with PRINT_LOCK:
+                            print(
+                                f"[WARNING] '{user_input}' does not match any of the "
+                                "TOP 5 species."
+                            )
+                        continue
+
+                    taxid = get_taxid_from_species_name(species_choice)
+                    if taxid is None:
+                        with PRINT_LOCK:
+                            print(
+                                f"[WARNING] No taxid found for '{species_choice}'. "
+                                "Try a different species."
+                            )
+                        continue
+
+                    if taxid in exclusion_set:
+                        with PRINT_LOCK:
+                            print(
+                                f"[WARNING] Species '{species_choice}' (txid={taxid}) "
+                                "is already excluded. Choose another."
+                            )
+                        continue
+
+                    # BUG NOTE: previously used 'txid' instead of 'taxid'
+                    exclusion_set.add(taxid)
+                    status_append_exclusion(record.id, species_choice, taxid)
+                    added_new_taxid = True
+                    break
+            finally:
+                status_pause_event.clear()
+
+        if not added_new_taxid:
+            status_set(record.id, status="COMPLETED", end_status="Done")
+            break
+
+    if status_store.get(record.id, {}).get("status") != "FAILED":
+        status_set(record.id, status="COMPLETED", end_status="Done")
+
+    return all_hits
+
+
+# ==================== PARSE BLAST XML ====================
+
+# Parse BLAST XML results into hit dictionaries and return (hits, number_alignments).
+def parse_blast_xml(handle, record):
+    hits = []
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                blast_record = NCBIXML.read(handle)
+    except xml.parsers.expat.ExpatError:
+        raise RuntimeError("BLAST_XML_ERROR")
+
+    number_alignments = len(blast_record.alignments)
+    primer_len = len(record.seq)
+    is_probe = record.id.lower().startswith("probe")
+
+    for alignment in blast_record.alignments:
+        for hsp in alignment.hsps:
+            percent_identity = (hsp.identities / primer_len) * 100.0
+            if percent_identity < 70.0:
+                continue
+
+            mismatches = hsp.align_length - hsp.gaps - hsp.identities
+
+            mismatch_positions = []
+            gap_intervals = []
+
+            if mismatches > 0:
+                aligned_query = hsp.query
+                aligned_sbjct = hsp.sbjct
+
+                mismatch_positions_5p = []
+                gap_intervals_5p = []
+
+                q_index = hsp.query_start
+                last_real_pos_5p = None
+                inside_gap = False
+
+                for q_base, s_base in zip(aligned_query, aligned_sbjct):
+                    if q_base == "-":
+                        inside_gap = True
+                        continue
+
+                    if inside_gap:
+                        if last_real_pos_5p is not None and 1 <= q_index <= primer_len:
+                            gap_intervals_5p.append((last_real_pos_5p, q_index))
+                        inside_gap = False
+
+                    if s_base == "-" or q_base != s_base:
+                        if 1 <= q_index <= primer_len:
+                            mismatch_positions_5p.append(q_index)
+
+                    last_real_pos_5p = q_index
+                    q_index += 1
+
+                if is_probe:
+                    mismatch_positions = mismatch_positions_5p
+                    gap_intervals = gap_intervals_5p
+                else:
+                    mismatch_positions = [
+                        primer_len - pos + 1 for pos in mismatch_positions_5p
+                    ]
+
+                    converted_intervals = []
+                    for left_5p, right_5p in gap_intervals_5p:
+                        left_3p = primer_len - left_5p + 1
+                        right_3p = primer_len - right_5p + 1
+                        a = min(left_3p, right_3p)
+                        b = max(left_3p, right_3p)
+                        converted_intervals.append((a, b))
+                    gap_intervals = converted_intervals
+
+            hits.append(
+                {
+                    "primer/probe": record.id,
+                    "accession": alignment.accession,
+                    "organism": alignment.hit_def,
+                    "percent_identity": percent_identity,
+                    "start": hsp.sbjct_start,
+                    "end": hsp.sbjct_end,
+                    "mismatches": mismatches,
+                    "mismatch_positions": mismatch_positions,
+                    "gap_intervals": gap_intervals,
+                    "strand": hsp.strand,
+                }
+            )
+
+    return hits, number_alignments
+
+
+# ==================== ORGANIZE HITS BY ACCESSION ====================
+
+# Group forward/reverse/probe hits by accession for downstream amplicon filtering.
+def organize_hits_by_accession(forward_hits, reverse_hits, probe_hits):
+    data = {}
+
+    for hit_list, label in [
+        (forward_hits, "forward"),
+        (reverse_hits, "reverse"),
+        (probe_hits, "probe"),
+    ]:
+        for hit in hit_list:
+            acc = hit["accession"]
+            if acc not in data:
+                data[acc] = {"forward": [], "reverse": [], "probe": []}
+            data[acc][label].append(hit)
+
+    return data
+
+
+# ==================== STRAND UTILS ====================
+
+# Extract the subject strand from a BLAST hit (supports tuple strand format).
+def _get_subject_strand(hit):
+    s = hit["strand"]
+    if isinstance(s, tuple) and len(s) == 2:
+        return s[1]
+    return s
+
+
+# ==================== FILTERS: AMPLICON SELECTION ====================
+
+# Filter grouped hits to retain only forward+reverse+probe combinations within amplicon size bounds.
+def filter_by_amplicon(data, min_size, max_size):
+    new_data = {}
+
+    for accession, info in data.items():
+        primers = info["forward"] + info["reverse"]
+        probes = info["probe"]
+
+        if len(primers) < 2 or not probes:
+            continue
+
+        fw_rev_p_combinations = []
+
+        for i in range(len(primers)):
+            for j in range(i + 1, len(primers)):
+                p1 = primers[i]
+                p2 = primers[j]
+
+                strand1 = _get_subject_strand(p1)
+                strand2 = _get_subject_strand(p2)
+                if strand1 == strand2:
+                    continue
+
+                if p1["start"] <= p2["start"]:
+                    f = p1
+                    r = p2
+                else:
+                    f = p2
+                    r = p1
+
+                inicio = min(f["start"], r["start"])
+                fin = max(f["start"], r["start"])
+                amplicon = abs(r["start"] - f["start"]) + 1
+
+                if not (min_size <= amplicon <= max_size):
+                    continue
+
+                for p in probes:
+                    probe_into = (
+                        inicio <= p["start"] <= fin
+                        and inicio <= p["end"] <= fin
+                    )
+                    if not probe_into:
+                        continue
+
+                    fw_rev_p_combinations.append(
+                        {
+                            "forward": f,
+                            "reverse": r,
+                            "probe": p,
+                            "amplicon_size": amplicon,
+                        }
+                    )
+
+        if fw_rev_p_combinations:
+            new_data[accession] = fw_rev_p_combinations
+
+    return new_data
+
+
+# End-point PCR mode: filter grouped hits keeping only forward+reverse combinations within size bounds.
+def end_point_option(data, min_size, max_size):
+    new_data = {}
+
+    for accession, info in data.items():
+        primers = info["forward"] + info["reverse"]
+        if len(primers) < 2:
+            continue
+
+        fw_rev_combinations = []
+
+        for i in range(len(primers)):
+            for j in range(i + 1, len(primers)):
+                p1 = primers[i]
+                p2 = primers[j]
+
+                strand1 = _get_subject_strand(p1)
+                strand2 = _get_subject_strand(p2)
+                if strand1 == strand2:
+                    continue
+
+                if p1["start"] <= p2["start"]:
+                    f = p1
+                    r = p2
+                else:
+                    f = p2
+                    r = p1
+
+                amplicon = abs(r["start"] - f["start"]) + 1
+                if min_size <= amplicon <= max_size:
+                    fw_rev_combinations.append(
+                        {
+                            "forward": f,
+                            "reverse": r,
+                            "amplicon_size": amplicon,
+                        }
+                    )
+
+        if fw_rev_combinations:
+            new_data[accession] = fw_rev_combinations
+
+    return new_data
+
+
+# ==================== OUTPUT TABLES (AMPLICONS) ====================
+
+# Write the final amplicon combinations table to a TSV-like file.
+def make_table(filtered_data, output_file):
+    with open(output_file, "w") as out:
+        header = [
+            "Accession",
+            "Organism",
+            "Forward_ID",
+            "Reverse_ID",
+            "Probe_ID",
+            "Start_F",
+            "Start_R",
+            "Strand_F",
+            "Strand_R",
+            "Amplicon_size",
+            "|",
+            "Mismatches_F",
+            "Mismatches_R",
+            "Mismatches_P",
+            "Mismatch_pos_F",
+            "Mismatch_pos_R",
+            "Mismatch_pos_P",
+            "|",
+            "Gap_intervals_F",
+            "Gap_intervals_R",
+            "Gap_intervals_P",
+        ]
+        out.write("\t".join(header) + "\n")
+
+        for acc, combinations in filtered_data.items():
+            for c in combinations:
+                f = c["forward"]
+                r = c["reverse"]
+                p = c.get("probe")
+
+                def pos_list_to_str(hit, key):
+                    if hit is None:
+                        return "-"
+                    pos_list = hit.get(key)
+                    if not pos_list:
+                        return "-"
+                    if pos_list and isinstance(pos_list[0], int):
+                        return ";".join(str(x) for x in pos_list)
+                    if pos_list and isinstance(pos_list[0], (tuple, list)):
+                        return ";".join(f"{a}-{b}" for a, b in pos_list)
+                    return "-"
+
+                row = [
+                    acc,
+                    f["organism"],
+                    f["primer/probe"],
+                    r["primer/probe"],
+                    p["primer/probe"] if p else "-",
+                    f["start"],
+                    r["start"],
+                    f["strand"],
+                    r["strand"],
+                    str(c["amplicon_size"]),
+                    "|",
+                    str(f["mismatches"]),
+                    str(r["mismatches"]),
+                    str(p["mismatches"]) if p else "-",
+                    pos_list_to_str(f, "mismatch_positions"),
+                    pos_list_to_str(r, "mismatch_positions"),
+                    pos_list_to_str(p, "mismatch_positions") if p else "-",
+                    "|",
+                    pos_list_to_str(f, "gap_intervals"),
+                    pos_list_to_str(r, "gap_intervals"),
+                    pos_list_to_str(p, "gap_intervals") if p else "-",
+                ]
+                out.write("\t".join(map(str, row)) + "\n")
+
+    print(f"Results saved in {output_file}")
+
+
+# Create a species-level summary (number of accessions and copy range) and save it to a companion file.
+def summary_table(filtered_data, output_file):
+    species_data = {}
+
+    for accession, combinations in filtered_data.items():
+        organism = combinations[0]["forward"]["organism"]
+        species = " ".join(organism.split()[:2])
+
+        unique_positions = set()
+        for c in combinations:
+            start_f = c["forward"]["start"]
+            start_r = c["reverse"]["start"]
+            unique_positions.add((start_f, start_r))
+
+        copies_in_accession = len(unique_positions)
+
+        if species not in species_data:
+            species_data[species] = {
+                "accessions": set(),
+                "copies_per_accession": [],
+            }
+
+        species_data[species]["accessions"].add(accession)
+        species_data[species]["copies_per_accession"].append(copies_in_accession)
+
+    summary_file = output_file + "_summary"
+
+    with open(summary_file, "w") as out:
+        out.write("Species\tNumber\tCopies\n")
+        for species, data in species_data.items():
+            copies_list = data["copies_per_accession"]
+            min_copies = min(copies_list)
+            max_copies = max(copies_list)
+            if min_copies == max_copies:
+                copies_str = str(min_copies)
+            else:
+                copies_str = f'="{min_copies}-{max_copies}"'
+            out.write(f"{species}\t{len(data['accessions'])}\t{copies_str}\n")
+
+    print(f"Summary saved in {summary_file}")
+
+
+# ==================== MAIN ====================
+
+# Main CLI pipeline: read oligos, collect exclusions, run parallel BLAST, filter amplicons, and write outputs.
+def main():
+    warnings.filterwarnings("ignore")
+    records = read_primers_and_probes()
+    all_hits = {"forward": [], "reverse": [], "probe": []}
+
+    exclusions = []
+    print("Enter organisms to exclude in BLAST (type 'done' to finish)")
+    print("  - You can type species names (e.g., Xanthomonas oryzae[Organism:exp)")
+    print("  - Or advanced Entrez terms (e.g., txid40324[Organism:exp])\n")
+
+    while True:
+        organism = input("Organism to exclude: ").strip()
+        if not organism:
+            continue
+        if organism.lower() == "done":
+            break
+
+        # If it looks like an advanced Entrez term (txid..., brackets, etc.), accept as-is
+        if organism.lower().startswith("txid") or "[" in organism or "]" in organism:
+            exclusions.append(organism)
+            continue
+
+        # If it looks like a standard species name, try to resolve its taxid via NCBI Taxonomy
+        taxid = get_taxid_from_species_name(organism)
+        if taxid is None:
+            print(
+                f"[WARNING] No species was found in NCBI Taxonomy with the name "
+                f"'{organism}'. Please type it again (or type 'done' to finish)."
+            )
+            continue
+
+        # If we found a taxid, build a robust Entrez exclusion term
+        term = f"txid{taxid}[Organism:exp]"
+        print(f"  -> Using '{term}' to exclude '{organism}'")
+        exclusions.append(term)
+
+    environmental_decision = input("Do you want to exclude environmental samples? (YES or NO): ").lower()
+    if environmental_decision == "yes":
+        exclusions.append("environmental[All Fields]")
+    
+    exclusions_list = exclusions if exclusions else []
+
+    database_option = input(
+        "Choose the database for BLAST search (core_nt or nt): "
+    ).strip()
+    pcr_type = input(
+        "Choose the PCR type between 'End_point' or 'Taqman': "
+    ).lower()
+    min_amplicon = int(input("Set the minimum amplicon size: "))
+    max_amplicon = int(input("Set the maximum amplicon size: "))
+    output_file = input("Enter the output file/folder name: ")
+
+    # ==================== CONFIGURE OUTPUT FOLDER ====================
+    # All results will be written inside a folder named after 'output_file'
+    global BASE_OUTPUT_DIR, BLAST_TABLES_DIR
+
+    BASE_OUTPUT_DIR = output_file
+    BLAST_TABLES_DIR = os.path.join(BASE_OUTPUT_DIR, "blast_tables")
+
+    # Create base folder and BLAST tables subfolder
+    os.makedirs(BLAST_TABLES_DIR, exist_ok=True)
+
+    for record in records:
+        status_set(
+            record.id,
+            status="QUEUED",
+            rid="-",
+            polls=0,
+            aligns="-",
+            hits="-",
+            exclusions="",
+            end_status="-",
+            restarts=0,
+            blast_tries=0,
+            parse_tries=0,
+        )
+
+    renderer_thread = None
+    if TABLE_UI:
+        renderer_thread = threading.Thread(
+            target=status_renderer_loop, daemon=True
+        )
+        renderer_thread.start()
+
+    futures = []
+    record_index = {}
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for record in records:
+                fut = executor.submit(
+                    run_blast, record, exclusions_list, database_option
+                )
+                futures.append(fut)
+                record_index[fut] = record
+
+            for fut in as_completed(futures):
+                record = record_index[fut]
+                try:
+                    hits = fut.result()
+                except Exception as e:
+                    status_set(
+                        record.id,
+                        status="FAILED",
+                        end_status=f"Failed ({type(e).__name__})",
+                    )
+                    print(
+                        f"\n[ERROR] Primer {record.id} failed with exception: {repr(e)}"
+                    )
+                    traceback.print_exc()
+                    hits = []
+
+                if record.id.startswith("forward"):
+                    all_hits["forward"].extend(hits)
+                elif record.id.startswith("reverse"):
+                    all_hits["reverse"].extend(hits)
+                elif record.id.startswith("probe"):
+                    all_hits["probe"].extend(hits)
+    finally:
+        status_stop_event.set()
+        if renderer_thread:
+            renderer_thread.join(timeout=2)
+        status_render_once()
+
+    hits_by_accession = organize_hits_by_accession(
+        all_hits["forward"],
+        all_hits["reverse"],
+        all_hits["probe"],
+    )
+    print(f"Total accessions found: {len(hits_by_accession)}")
+
+    if pcr_type == "taqman":
+        final_filtered_sequences = filter_by_amplicon(
+            hits_by_accession, min_amplicon, max_amplicon
+        )
+        print(
+            f"Total accessions that passed the filters: {len(final_filtered_sequences)}"
+        )
+    elif pcr_type == "end_point":
+        final_filtered_sequences = end_point_option(
+            hits_by_accession, min_amplicon, max_amplicon
+        )
+        print(
+            f"Total accessions that passed the filters: {len(final_filtered_sequences)}"
+        )
+    else:
+        print("PCR type not recognized. Use 'End_point' or 'Taqman'.")
+        return
+
+    # Write amplicons and summary inside BASE_OUTPUT_DIR
+    amplicon_base = os.path.join(BASE_OUTPUT_DIR, output_file)
+
+    make_table(final_filtered_sequences, amplicon_base)
+    summary_table(final_filtered_sequences, amplicon_base)
+
+
+if __name__ == "__main__":
+    main()
