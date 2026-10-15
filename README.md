@@ -1,4 +1,4 @@
-[README (1).md](https://github.com/user-attachments/files/33494156/README.1.md)
+[README (2).md](https://github.com/user-attachments/files/33494452/README.2.md)
 # Exclusivity Assay for Primer Design
 
 ## Overview
@@ -63,21 +63,21 @@ The main timing and retry settings are defined near the top of the script:
 
 These settings can be adjusted in the script. BLAST is a remote service, so execution time depends on NCBI response times, the number and length of input oligonucleotides, ambiguity expansion and the amount of returned data.
 
-## Running on Windows with the launcher (`run_pipeline.bat`)
+## Running on Windows with the launcher (`run_script_on_Windows.bat`)
 
-The project includes a Windows batch file named `run_pipeline.bat`. This launcher makes it easier to start the pipeline on Windows without typing the Python command manually. It must be placed in the **same folder** as `exclusivity_assay.py`.
+The project includes a Windows batch file named `run_script_on_Windows.bat`. This launcher makes it easier to start the pipeline on Windows without typing the Python command manually. It must be placed in the **same folder** as `exclusivity_assay.py`.
 
 The folder should contain at least:
 
 ```text
 project_folder/
 ├── exclusivity_assay.py
-└── run_pipeline.bat
+└── run_script_on_Windows.bat
 ```
 
 ### What the Windows launcher does
 
-When you run `run_pipeline.bat`, it:
+When you run `run_script_on_Windows.bat`, it:
 
 1. Changes the working directory to the folder where the `.bat` file is located.
 2. Checks that `exclusivity_assay.py` exists in that folder.
@@ -103,8 +103,8 @@ or
 python -m pip install biopython
 ```
 
-- Keep `run_pipeline.bat` and `exclusivity_assay.py` in the same folder.
-- Double-click `run_pipeline.bat` in File Explorer to launch the pipeline. Alternatively, run it from Command Prompt.
+- Keep `run_script_on_Windows.bat` and `exclusivity_assay.py` in the same folder.
+- Double-click `run_script_on_Windows.bat` in File Explorer to launch the pipeline. Alternatively, run it from Command Prompt.
 
 The `.bat` file is a convenience launcher only; the pipeline still runs the Python script and requires an internet connection to access NCBI services.
 
