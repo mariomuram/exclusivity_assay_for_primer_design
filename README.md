@@ -1,4 +1,4 @@
-[README (2).md](https://github.com/user-attachments/files/33494452/README.2.md)
+[README.md](https://github.com/user-attachments/files/33494452/README.2.md)
 # Exclusivity Assay for Primer Design
 
 ## Overview
